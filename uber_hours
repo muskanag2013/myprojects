@@ -1,0 +1,136 @@
+CREATE TEMP FUNCTION ExtractBusinessHoursWithExceptions(json_data STRING)
+RETURNS ARRAY<STRUCT<param_name STRING, day_index INT, day_value BOOLEAN, start_time STRING, end_time STRING, is_exception BOOLEAN>>
+LANGUAGE js
+AS """
+  try {
+    const data = JSON.parse(json_data);
+    
+    // Find menus object
+    let menus;
+    if (data.data && data.data.menus) {
+      menus = data.data.menus;
+    } else if (data.menus) {
+      menus = data.menus;
+    } else {
+      return [{param_name: 'Error', day_index: -1, day_value: false, start_time: 'No menus found', end_time: 'No menus found', is_exception: false}];
+    }
+    
+    // Get first menu key and menu
+    const firstMenuKey = Object.keys(menus)[0];
+    if (!firstMenuKey) {
+      return [{param_name: 'Error', day_index: -1, day_value: false, start_time: 'No menu keys found', end_time: 'No menu keys found', is_exception: false}];
+    }
+    
+    const firstMenu = menus[firstMenuKey];
+    
+    // Check if sections exist
+    if (!firstMenu.sections || firstMenu.sections.length === 0) {
+      return [{param_name: 'Error', day_index: -1, day_value: false, start_time: 'No sections found', end_time: 'No sections found', is_exception: false}];
+    }
+    
+    const firstSection = firstMenu.sections[0];
+    
+    // Check if regularHours exist
+    if (!firstSection.regularHours || firstSection.regularHours.length === 0) {
+      return [{param_name: 'Error', day_index: -1, day_value: false, start_time: 'No regular hours found', end_time: 'No regular hours found', is_exception: false}];
+    }
+    
+    const regularHours = firstSection.regularHours[0];
+    const defaultStartTime = regularHours.startTime || 'No start time';
+    const defaultEndTime = regularHours.endTime || 'No end time';
+    
+    // Build a map of day exceptions if regularHoursExceptions exists
+    const exceptions = {};
+    if (firstSection.regularHoursExceptions && Array.isArray(firstSection.regularHoursExceptions)) {
+      firstSection.regularHoursExceptions.forEach(exception => {
+        if (exception.daysBitArray && Array.isArray(exception.daysBitArray)) {
+          exception.daysBitArray.forEach((isException, dayIndex) => {
+            if (isException) {
+              exceptions[dayIndex] = {
+                start_time: exception.startTime || defaultStartTime,
+                end_time: exception.endTime || defaultEndTime
+              };
+            }
+          });
+        }
+      });
+    }
+    
+    // Create result with one row per daysBitArray entry
+    const result = [];
+    
+    if (regularHours.daysBitArray && Array.isArray(regularHours.daysBitArray)) {
+      regularHours.daysBitArray.forEach((value, index) => {
+        // Check if there's an exception for this day
+        const hasException = exceptions[index] !== undefined;
+        const startTime = hasException ? exceptions[index].start_time : defaultStartTime;
+        const endTime = hasException ? exceptions[index].end_time : defaultEndTime;
+        
+        result.push({
+          param_name: 'daysBitArray',
+          day_index: index,
+          day_value: value,
+          start_time: startTime,
+          end_time: endTime,
+          is_exception: hasException
+        });
+      });
+    } else {
+      // If no daysBitArray, still return one row with the hours
+      result.push({
+        param_name: 'No daysBitArray',
+        day_index: -1,
+        day_value: false,
+        start_time: defaultStartTime,
+        end_time: defaultEndTime,
+        is_exception: false
+      });
+    }
+    
+    return result;
+  } catch (error) {
+    return [{
+      param_name: 'Error: ' + error.message,
+      day_index: -1,
+      day_value: false,
+      start_time: 'Error',
+      end_time: 'Error',
+      is_exception: false
+    }];
+  }
+""";
+
+-- Use the function to extract detailed business hours with exceptions
+with structured_data as (
+SELECT 
+  vb_name,
+  slug,
+  hours.param_name,
+  hours.day_index,
+  hours.day_value,
+  hours.start_time,
+  hours.end_time,
+  hours.is_exception,
+  CASE hours.day_index
+    WHEN 0 THEN 'Monday'
+    WHEN 1 THEN 'Tuesday'
+    WHEN 2 THEN 'Wednesday'
+    WHEN 3 THEN 'Thursday'
+    WHEN 4 THEN 'Friday'
+    WHEN 5 THEN 'Saturday'
+    WHEN 6 THEN 'Sunday'
+    ELSE 'Unknown'
+  END AS day_name
+FROM
+  arboreal-vision-339901.take_home_v2.virtual_kitchen_ubereats_hours,
+  UNNEST(ExtractBusinessHoursWithExceptions(TO_JSON_STRING(response))) AS hours
+where day_value is true
+ORDER BY slug, hours.day_index
+)
+
+, 
+final_uber_data as (
+Select distinct vb_name, slug,day_name,day_value, start_time, end_time
+from structured_data
+)
+
